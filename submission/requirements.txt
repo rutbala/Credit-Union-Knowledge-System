@@ -1,0 +1,2 @@
+# Local semantic search (ONNX, CPU). Without it the system falls back to keyword search only.
+fastembed==0.7.4
