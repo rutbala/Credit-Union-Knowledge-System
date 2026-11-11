@@ -80,3 +80,19 @@ def authority(tier: int, published: Optional[str], taken_on: str, strict: bool =
         age_years = (int(taken_on[:4]) - int(published[:4])) + (int(taken_on[5:7]) - int(published[5:7])) / 12
         w *= max(0.75, 1.0 - 0.06 * max(age_years, 0.0))   # a 2026 release beats its 2021 twin
     return w
+
+
+KIND_LABEL = {TIER_PRODUCT: "official product page", TIER_PROMO: "promotion page", TIER_TOOL: "calculator or PDF",
+              TIER_ARTICLE: "news or blog article", TIER_LISTING: "article listing"}
+
+
+def page_kind(version) -> str:
+    """How an LLM should weigh a page: its tier, the rate sheet, and an article's date."""
+    if version is None:
+        return "page"
+    if page_path(version.url) in ("rates", "business-rates"):
+        return "official rate sheet"
+    kind = KIND_LABEL.get(version.tier, "page")
+    if version.tier == TIER_ARTICLE and version.published:
+        kind += ", published " + version.published
+    return kind

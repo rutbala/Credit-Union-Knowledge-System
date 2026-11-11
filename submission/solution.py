@@ -78,6 +78,7 @@ from kb.authority import (  # noqa: E402
     TIER_LISTING,
     TIER_JUNK,
     TIER_WEIGHT_STRICT,
+    page_kind,
     TIER_WEIGHT_MILD,
     CURRENT_FACT,
     PROMO_PATHS,
@@ -99,7 +100,7 @@ from kb.store import (  # noqa: E402
 )
 from kb.ingest import find_boilerplate, strip_boilerplate  # noqa: E402
 from kb.vectors import VectorIndex, append_fusion, rrf  # noqa: E402
-from kb.llm import Writer  # noqa: E402
+from kb.llm import NOT_FOUND, Writer  # noqa: E402
 from kb.bm25 import (  # noqa: E402
     SearchIndex,
 )
@@ -141,6 +142,8 @@ GENERIC = frozenset(tokenize(
     # Filler around the product ("over six years", "financing", "what does it pay") and date words
     # (an "in May 2026" question is already answered from the May snapshot).
     "over under would financing finance pay pays paying earning earns "
+    # Relative time says *when*, not *what* ("used VTO last year" vs "the last 11 years of her career").
+    "last year years ago recent recently past "
     + " ".join(MONTHS)))
 # Question-side synonyms (stemmed): a focus term counts as covered if any alternative appears.
 SYNONYMS = {
@@ -203,6 +206,7 @@ class Query:
     wants_list: bool
     business: bool                   # the question is about business products
     variants: frozenset = frozenset()   # product variants the question names (jumbo, ira)
+    phrases: tuple = ()                 # multi-word names as written ("Volunteer Time Off")
 
 
 NUMBER_WORDS = {w: str(i) for i, w in enumerate(
@@ -220,6 +224,20 @@ def normalize_terms(question: str) -> str:
     if re.search(r"\bmortgage|home loan|refinanc", q, re.I):
         return q
     return SHORT_YEARS.sub(lambda m: "%d-month" % (int(m.group(1)) * 12) if int(m.group(1)) <= 7 else m.group(0), q)
+
+
+# Two or more capitalised words in a row name one thing ("Volunteer Time Off", "Bright Savings");
+# a passage that uses the member's exact name is about that thing, not just the same words.
+NAME_PHRASE = re.compile(r"\b[A-Z][a-z]+(?:[ -](?:[A-Z][a-z]+|[A-Z]{2,}))+\b")
+PHRASE_BONUS = 1.0
+# Questions the rules hand to the LLM fallback (when one is configured).
+YES_NO = re.compile(r"^\s*(do|does|is|are|can)\b.*\b(all|any|every|same|still)\b", re.I)
+LLM_WEAK_COVERAGE = 0.8   # best passage is prose covering less than this share of the question
+LLM_EXCERPTS = 10
+LLM_EXCERPT_CHARS = 700
+# "Do any savings tiers pay 0.35% APY?": the percentage is a claim to check, not a tier to match.
+CLAIM = re.compile(r"^\s*(do|does|is|are|can|will|did|has|have)\b", re.I)
+CLAIM_PCT = re.compile(r"\b\d+(?:\.\d+)?\s?%\s*(?:apy|apr)?", re.I)
 
 
 def parse_query(question: str) -> Query:
@@ -242,7 +260,11 @@ def parse_query(question: str) -> Query:
     variants = frozenset(v for v, rx in VARIANT_WORDS.items() if rx.search(question) or (v == "ira" and re.search(r"retire", question, re.I)))
     if kind is None and DEPOSIT_PAY.search(question) and DEPOSIT_WORDS.search(question):
         kind, value_re = next((k, v) for k, _, v in ANSWER_KINDS if k == "rate")
-    return Query(question, expansion, focus, names, kind, value_re, numbers, term_numbers, wants_list, business, variants)
+    phrases = tuple(ph for ph in (re.sub(r"^dupaco\s+", "", m.lower())    # "Dupaco Platinum Visa" -> "platinum visa"
+                                  for m in NAME_PHRASE.findall(question.split(" ", 1)[-1]))
+                    if " " in ph and not set(tokenize(ph)) <= GENERIC)
+    return Query(question, expansion, focus, names, kind, value_re, numbers, term_numbers, wants_list, business,
+                 variants, phrases)
 
 
 def proper_names(question: str) -> List[str]:
@@ -377,7 +399,9 @@ class Composer:
                 s = (rank_score / top) + 2.0 * coverage + 0.5 * inside + 1.0 * hits_n - 1.5 * conflicts
                 if q.value_re is not None:
                     s += 1.5 if has_value else -1.5
-                s += 2.0 * weights.get(chunk.url, 0.0)   # authority of the page this passage is on
+                low = text.lower()
+                s += PHRASE_BONUS * sum(1 for ph in q.phrases if ph in low)
+                s += 2.0 * weights.get((chunk.url, chunk.heading), 0.0)   # authority of the page this passage is on
                 if not q.business and not q.wants_list and BUSINESS.search(chunk.heading + " " + text[:80]):
                     s -= BUSINESS_PENALTY    # "Rewards Visa" and "Business Rewards Visa" are different products
                 label = chunk.heading.split(" > ")[-1] + " " + text[:80]
@@ -473,7 +497,7 @@ class Composer:
 # it is remembered, so the system can say what is true in any snapshot and why.
 
 PCT = re.compile(r"(\d+(?:\.\d+)?)\s?%(?:\s*[–-]\s*(\d+(?:\.\d+)?)\s?%)?")
-KEY_FILLER = frozenset("account accounts rate rates the of and".split())
+KEY_FILLER = frozenset("account accounts rate rates the of and certificate certificates".split())   # "Regular" vs "Regular Certificates" label
 METRIC_PRIORITY = ("APY", "APR", "rate", "dividend rate")   # which column headlines a row
 
 # (fact name, how the topic reads, pattern whose group 1 is the value, answer template)
@@ -503,6 +527,10 @@ FACT_QUESTIONS = [
 ]
 
 MAX_CONFLICTS = 35
+LOAN_WORDS = re.compile(r"\b(loan|mortgage|heloc|visa|card)\b")
+STALE_MIN_ROWS = 2       # a page must repeat at least this many rate-sheet rows to be judged
+STALE_SHARE = 0.5        # ...and disagree on at least this share of them to count as stale
+STALE_WEIGHT = 0.6       # retrieval weight multiplier for a stale table
 MAX_PER_TABLE = 2        # tiers of one product table reported, so one stale table cannot fill the list
 
 
@@ -562,6 +590,7 @@ class FactEntry:
     url: str
     content_hash: str
     row: str          # the rendered table row or sentence that states it
+    table: str = ""   # heading of the table it came from ("" for prose)
 
 
 # Pages name the same product differently ("Auto Loan Rates" on a promo, "Auto & Motorcycle
@@ -596,6 +625,8 @@ def table_facts(chunk: Chunk) -> List[Tuple[str, str, str, str]]:
         for part in values.split("; "):
             m = PCT.search(part)
             metric = metric_of(part[: m.start()]) if m else None
+            if metric == "APY" and LOAN_WORDS.search(base):
+                metric = "APR"     # a loan has no APY: the calculator mislabels its auto rates
             if metric:
                 out.append((base + " | " + metric, "%s (%s)" % (topic, metric), canon_pct(m), row))
     return out
@@ -638,17 +669,20 @@ class FactStore:
         self.prose_keys = {name for name, *_ in PROSE_FACTS}
         self._seen = set()
         self._cache: Dict[Tuple[str, str], Optional[Resolution]] = {}
+        self._stale_cache: Dict[str, Dict[str, float]] = {}
 
     def add_page(self, url: str, content_hash: str, chunks: List[Chunk], text: str) -> None:
         if (url, content_hash) in self._seen:
             return               # same page content as an earlier snapshot: already recorded
         self._seen.add((url, content_hash))
-        found = [f for c in chunks if c.is_table for f in table_facts(c)] + prose_facts(text)
-        for key, topic, value, row in found:
-            self.entries[key].append(FactEntry(key, value, url, content_hash, row))
+        found = [(f, c.heading) for c in chunks if c.is_table for f in table_facts(c)] \
+            + [(f, "") for f in prose_facts(text)]
+        for (key, topic, value, row), table in found:
+            self.entries[key].append(FactEntry(key, value, url, content_hash, row, table))
             self.topics.setdefault(key, topic)
             self.families[family_of(key)].add(key)
         self._cache.clear()
+        self._stale_cache.clear()
 
     def present(self, entry: FactEntry, snapshot_id: str) -> Optional[PageVersion]:
         v = self.store.version(snapshot_id, entry.url)
@@ -709,6 +743,37 @@ class FactStore:
             return None
         return Resolution(res.value, res.entry, res.version,
                           res.reason + "; this tier was replaced by \"%s\"" % self.topics[sheet_keys[0]])
+
+    def staleness(self, snapshot_id: str) -> Dict[Tuple[str, str], float]:
+        """Per (page, table): share of the rate-sheet rows it repeats that disagree with the sheet.
+
+        A table frozen while the rate sheet moved (the auto-loan table on /switch-and-earn still
+        at 5.34%, /homebuying-guidance at 6.037%) disagrees on most rows it copies; a faithful
+        copy disagrees on none. Judged per table, because one page can carry a stale auto table
+        next to up-to-date ones, and per snapshot, because a table only goes stale once the
+        sheet moves past it."""
+        if snapshot_id in self._stale_cache:
+            return self._stale_cache[snapshot_id]
+        counts: Dict[Tuple[str, str], List[int]] = defaultdict(lambda: [0, 0])
+        for key, entries in self.entries.items():
+            if key in self.prose_keys:
+                continue
+            res = None
+            for e in entries:
+                if not e.table or page_path(e.url) in RATE_SHEETS or self.present(e, snapshot_id) is None:
+                    continue
+                if res is None:
+                    res = self.resolve(key, snapshot_id)
+                    if res is None or page_path(res.version.url) not in RATE_SHEETS:
+                        break              # no official value to compare against
+                counts[(e.url, e.table)][1] += 1
+                counts[(e.url, e.table)][0] += e.value != res.value
+        out = {t: bad / n for t, (bad, n) in counts.items() if n >= STALE_MIN_ROWS}
+        self._stale_cache[snapshot_id] = out
+        return out
+
+    def is_stale(self, url: str, table: str, snapshot_id: str) -> bool:
+        return self.staleness(snapshot_id).get((url, table), 0.0) >= STALE_SHARE
 
     def explain(self, key: str, v: PageVersion) -> str:
         path = "/" + page_path(v.url)
@@ -878,12 +943,19 @@ class KnowledgeBase:
         ranked = []
         for order, (i, score) in enumerate(candidates):
             chunk = self.index.chunks[i]
-            v = self.store.version(snapshot_id, chunk.url)
-            w = v.weight(strict) if v is not None else 0.0
+            w = self._chunk_weight(chunk, snapshot_id, strict)
             if w > 0:
                 ranked.append((score * w, order, chunk))
         ranked.sort(key=lambda r: (-r[0], r[1]))
         return [(s, c) for s, _, c in ranked[:k]]
+
+    def _chunk_weight(self, chunk: Chunk, snapshot_id: str, strict: bool) -> float:
+        """Page authority, discounted when this chunk is a table that has gone stale."""
+        v = self.store.version(snapshot_id, chunk.url)
+        w = v.weight(strict) if v is not None else 0.0
+        if chunk.is_table and self.facts.is_stale(chunk.url, chunk.heading, snapshot_id):
+            w *= STALE_WEIGHT
+        return w
 
     def answer(self, question: str, as_of: Optional[str] = None) -> Answer:
         sid = self.store.snapshot_for(as_of)
@@ -901,12 +973,14 @@ class KnowledgeBase:
         if not hits:
             return Answer(text=REFUSAL, confident=False)
         strict = bool(CURRENT_FACT.search(question))
-        weights = {}
-        for _, c in hits:
-            v = self.store.version(sid, c.url)
-            weights[c.url] = v.weight(strict) if v is not None else 0.0
+        weights = {(c.url, c.heading): self._chunk_weight(c, sid, strict) for _, c in hits}
         units = self.composer.score(q, hits, weights)
-        if not units or self.composer.refuse(units[0]):
+        refused = not units or self.composer.refuse(units[0])
+        if self.writer is not None and self.writer.fallback_enabled and self._needs_llm(question, q, units, refused):
+            llm = self._llm_answer(question, sid, units)
+            if llm is not None:
+                return llm
+        if refused:
             return Answer(text=REFUSAL, confident=False)
         notes: List[str] = []
         text, chunks, extra = self.composer.compose(q, units, lambda c, r: self._fix_row(c, r, sid, notes))
@@ -917,6 +991,43 @@ class KnowledgeBase:
         sources += [Source(url=u, snapshot_id=sid) for u in self._corroborating(text, sid, {s.url for s in sources})]
         return Answer(text=text, sources=list({s.url: s for s in sources}.values()),
                       conflict_note="; ".join(dict.fromkeys(notes)) or None)
+
+    def _needs_llm(self, question: str, q: Query, units: List[Scored], refused: bool) -> bool:
+        """The rules are unsure: they refused, the question checks a claimed value, it asks a
+        yes/no question about all/any/same, or the best passage is prose that covers little of it."""
+        if q.kind == "url":
+            return False
+        if refused or (CLAIM.search(question) and CLAIM_PCT.search(question)) or YES_NO.search(question):
+            return True
+        best = units[0]
+        return not best.chunk.is_table and best.coverage < LLM_WEAK_COVERAGE
+
+    def _llm_answer(self, question: str, sid: str, units: List[Scored]) -> Optional[Answer]:
+        """Ask the LLM to answer from the top passages; None keeps the deterministic path."""
+        excerpts, origin, seen = [], [], set()
+        for u in units:
+            if len(excerpts) >= LLM_EXCERPTS:
+                break
+            if u.text in seen or (u.chunk.is_table and self.facts.is_stale(u.chunk.url, u.chunk.heading, sid)):
+                continue
+            seen.add(u.text)
+            v = self.store.version(sid, u.chunk.url)
+            label = u.chunk.heading.split(" > ")[-1]
+            excerpts.append(("/" + page_path(u.chunk.url), page_kind(v),
+                             (label + ": " + u.text)[:LLM_EXCERPT_CHARS]))
+            origin.append(u.chunk)
+        today = dict(zip(self.store.snapshot_ids, self.store.snapshot_dates)).get(sid, "")
+        res = self.writer.answer(question, today, excerpts)
+        if res is None:
+            return None
+        text, used = res
+        if text == NOT_FOUND:
+            return Answer(text=REFUSAL, confident=False)
+        chunks = [origin[i] for i in used] or origin[:1]
+        sources = [Source(url=c.url, snapshot_id=sid, quote=c.heading[:200]) for c in chunks]
+        sources += [Source(url=u, snapshot_id=sid) for u in self._corroborating(text, sid, {s.url for s in sources})]
+        return Answer(text=text, sources=list({s.url: s for s in sources}.values()),
+                      conflict_note="answered by the LLM from %d website excerpts" % len(excerpts))
 
     def _corroborating(self, text: str, sid: str, have: set) -> List[str]:
         """Maintained product pages in this snapshot that state the answer's key values.
