@@ -14,9 +14,10 @@ Providers (first one configured wins; nothing configured -> LLM off):
                                          Azure OpenAI Responses API (standard library only)
 
 Switches (real environment variables win over a .env file found above this folder):
-  KB_LLM          off | on       default off: on the practice and validation sets the fallback
-                                 did not raise accuracy and cost latency (see NOTES.md)
+  KB_LLM          off | on       default: on whenever a provider key is configured, off otherwise
+                                 (measured on our holdout sets: 0.753 -> 0.876, see NOTES.md)
   KB_LLM_MODE     fallback | polish | both   default fallback (polish = reword every answer)
+  KB_LLM_ROUTE    narrow | prose (default prose; see solution.KnowledgeBase._needs_llm)
   KB_LLM_TIMEOUT  seconds per call, default 3 (the speed score drops past 2 s per answer)
 """
 import json
@@ -171,8 +172,8 @@ class Writer:
     @classmethod
     def load(cls) -> Optional["Writer"]:
         _load_dotenv()
-        if os.environ.get("KB_LLM", "off").lower() != "on":
-            return None
+        if os.environ.get("KB_LLM", "").strip().lower() == "off":
+            return None                 # explicitly disabled; otherwise on when a key is set
         provider = _provider()
         if provider is None:
             if os.environ.get("KB_LLM", "").lower() == "on":

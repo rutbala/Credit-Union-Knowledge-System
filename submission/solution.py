@@ -254,7 +254,12 @@ PHRASE_BONUS = 1.0
 YES_NO = re.compile(r"^\s*(do|does|is|are|can)\b.*\b(all|any|every|same|still)\b", re.I)
 RERANK_TOP = 20          # candidates the cross-encoder reads per question
 LLM_WEAK_COVERAGE = 0.8   # best passage is prose covering less than this share of the question
-LLM_EXCERPTS = 10
+LLM_EXCERPTS = 12
+LLM_PER_CHUNK = 3         # at most this many excerpts from one section
+LLM_ROUTE = os.environ.get("KB_LLM_ROUTE", "prose")   # narrow | prose (see _needs_llm)
+# Rate questions about an attribute that is written in the fine print, not in the table.
+FINE_PRINT = re.compile(r"\b(maximum|max|minimum|min|floor|cap|ceiling|penalt\w*|compound\w*|closing costs?|"
+                        r"credit score|deductible|how often|recoup|fees?)\b", re.I)
 LLM_EXCERPT_CHARS = 700
 # "Do any savings tiers pay 0.35% APY?": the percentage is a claim to check, not a tier to match.
 CLAIM = re.compile(r"^\s*(do|does|is|are|can|will|did|has|have)\b", re.I)
@@ -1019,7 +1024,7 @@ class KnowledgeBase:
             units = self._rerank(question, units)
         refused = not units or self.composer.refuse(units[0])
         if self.writer is not None and self.writer.fallback_enabled and self._needs_llm(question, q, units, refused):
-            llm = self._llm_answer(question, sid, units)
+            llm = self._llm_answer(question, q, sid, units, refused)
             if llm is not None:
                 return llm
         if refused:
@@ -1053,23 +1058,38 @@ class KnowledgeBase:
         return sorted(top, key=lambda u: (-u.score, u.order)) + units[RERANK_TOP:]
 
     def _needs_llm(self, question: str, q: Query, units: List[Scored], refused: bool) -> bool:
-        """The rules are unsure: they refused, the question checks a claimed value, it asks a
-        yes/no question about all/any/same, or the best passage is prose that covers little of it."""
+        """Which questions the LLM answers (the rules then validate its answer).
+
+        narrow: only when the rules are unsure (refused, claim check, yes/no about all/any/same,
+                weak prose match).
+        prose:  also every question whose best rule candidate is prose, and rate questions about
+                an attribute that lives in fine print (maximum, floor, penalty, compounding...).
+                Rate/tier questions answered from a table stay with the rules: fast and exact."""
         if q.kind == "url":
             return False
         if refused or (CLAIM.search(question) and CLAIM_PCT.search(question)) or YES_NO.search(question):
             return True
         best = units[0]
+        if LLM_ROUTE == "prose":
+            return not best.chunk.is_table or bool(FINE_PRINT.search(question))
         return not best.chunk.is_table and best.coverage < LLM_WEAK_COVERAGE
 
-    def _llm_answer(self, question: str, sid: str, units: List[Scored]) -> Optional[Answer]:
-        """Ask the LLM to answer from the top passages; None keeps the deterministic path."""
-        excerpts, origin, seen = [], [], set()
+    def _llm_answer(self, question: str, q: Query, sid: str, units: List[Scored],
+                    refused: bool) -> Optional[Answer]:
+        """Ask the LLM to answer from the top passages, then validate its answer with the rules.
+
+        None keeps the deterministic path: call failed, a number not in the passages, or an
+        answer about another product family than the question names."""
+        excerpts, origin, seen, per_chunk = [], [], set(), Counter()
         for u in units:
             if len(excerpts) >= LLM_EXCERPTS:
                 break
             if u.text in seen or (u.chunk.is_table and self.facts.is_stale(u.chunk.url, u.chunk.heading, sid)):
                 continue
+            key = (u.chunk.url, u.chunk.heading)
+            if per_chunk[key] >= LLM_PER_CHUNK:
+                continue               # spread the excerpts over several sections and pages
+            per_chunk[key] += 1
             seen.add(u.text)
             v = self.store.version(sid, u.chunk.url)
             label = u.chunk.heading.split(" > ")[-1]
@@ -1082,7 +1102,11 @@ class KnowledgeBase:
             return None
         text, used = res
         if text == NOT_FOUND:
-            return Answer(text=REFUSAL, confident=False)
+            # The rules had an answer: keep it rather than refuse on the LLM's word alone.
+            return Answer(text=REFUSAL, confident=False) if refused else None
+        fams = product_families(text)
+        if q.families and fams and not (q.families & fams):
+            return None                # validation: about another product than asked
         chunks = [origin[i] for i in used] or origin[:1]
         sources = [Source(url=c.url, snapshot_id=sid, quote=c.heading[:200]) for c in chunks]
         sources += [Source(url=u, snapshot_id=sid) for u in self._corroborating(text, sid, {s.url for s in sources})]

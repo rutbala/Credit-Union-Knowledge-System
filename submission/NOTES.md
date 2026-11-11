@@ -1,12 +1,23 @@
 # NOTES
 
-A rule-based knowledge system with hybrid (keyword + semantic) search. Every answer is chosen by
-deterministic rules over a dated, sourced history of the website; an LLM is optional and off by
-default.
+A knowledge system with hybrid (keyword + semantic) search over a dated, sourced history of the
+website. Rules decide which value is current; an LLM (Azure OpenAI) answers descriptive and
+fine-print questions from the retrieved passages, and the rules validate its answers.
 
 **Running:** `pip install -r submission/requirements.txt`, then
 `python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl`.
-**API keys:** none needed. **Paid APIs:** none by default (see *Optional LLM* below).
+
+**API keys (paid API: Azure OpenAI).** Set these environment variables to enable the LLM:
+
+| Variable | Value |
+|---|---|
+| `AZURE_OPENAI_API_KEY` | the Azure resource key |
+| `AZURE_OPENAI_MODEL` | the deployment name |
+| `AZURE_OPENAI_ENDPOINT` | the Responses API URL (default: `https://llm-model-test-hars.services.ai.azure.com/openai/v1/responses`) |
+
+With them set, the LLM is on automatically (`KB_LLM=off` disables it). Without them the system
+runs fully deterministic, with no API calls; it scores lower on descriptive questions (see
+*Results*) but every other part works the same.
 
 ## How it works
 
@@ -86,20 +97,28 @@ product merged, entries with identical competing values (IRA specials mirroring 
 specials) listed once, stale-page contradictions and prose facts first. Output order is
 deterministic.
 
-## Optional LLM (off by default)
+## The LLM layer (on when a key is set)
 
-`submission/kb/llm.py` can hand questions the rules are unsure about (refusals, claim checks such as
-"do any tiers pay 0.35%?", weak prose matches) to an LLM, together with the top passages labelled by
-page type and date. Guards: every number in its answer must appear in those passages or the
-question; "not found" replies become the standard refusal; any error or timeout keeps the
-deterministic answer. It never decides which value is current; stale tables are not shown to it.
+`submission/kb/llm.py`. Rate and tier questions whose best candidate is a table stay with the rules
+(fast and exact; that is where stale values live). The LLM answers:
 
-Enable with `KB_LLM=on` and either `ANTHROPIC_API_KEY` (plus `pip install anthropic`; model
-`ANTHROPIC_MODEL`, default `claude-haiku-5-5` for latency) or `AZURE_OPENAI_API_KEY` +
-`AZURE_OPENAI_MODEL` (+ `AZURE_OPENAI_ENDPOINT`). Both are paid APIs. It is off by default because,
-measured on our evaluation sets, it did not raise accuracy (the remaining misses are retrieval
-problems or answers the practice set judges differently) and it added ~2 s of latency per routed
-question.
+- questions whose best rule candidate is a prose passage (descriptive questions, facts inside long
+  pages, wording the page does not use: "who do I phone to buy insurance" -> "ext. 210");
+- rate questions about an attribute written in fine print (maximum, floor, penalty, compounding,
+  closing costs, credit score, fees);
+- questions the rules refused, claim checks ("do any tiers pay 0.35%?") and yes/no questions about
+  all/any/same.
+
+It sees up to 12 passages from the retriever, spread over several sections, each labelled with its
+page and page type (official rate sheet, product page, promotion, article with its date). The rules
+then validate its answer: every number must appear in those passages or the question; the answer
+must be about the product family asked; stale tables are never shown to it. A "not found" reply
+becomes the standard refusal only if the rules had refused too; any error, timeout (3 s) or failed
+check keeps the deterministic answer. The LLM never decides which value is current.
+
+Switches: `KB_LLM=off`, `KB_LLM_ROUTE=narrow` (only when the rules are unsure), `KB_LLM_TIMEOUT`.
+An Anthropic provider is also implemented (`ANTHROPIC_API_KEY`, needs `pip install anthropic`) but
+untested; Azure is the provider we measured.
 
 ## Tried and not adopted
 
@@ -107,17 +126,29 @@ question.
   added to the rule score when choosing between prose passages. It fixed one development question
   but left a fresh holdout unchanged (0.727 -> 0.727; with more weight 0.682), adds ~0.2 s per
   answer, and the best model (126 MB) exceeds GitHub's file limit. Off.
-- **LLM fallback / rewriter** (above): no accuracy gain on our sets. Off.
+- **LLM only as a fallback when the rules are unsure** (`KB_LLM_ROUTE=narrow`): the rules are
+  often confidently wrong on descriptive questions, so it rarely triggered where it would help.
+  Routing all prose questions to it did better (below).
+- **LLM rewriting every answer** (`KB_LLM_MODE=polish`): no accuracy change, only latency. Off.
 
 ## Results and runtime
 
-| Set | Score (accuracy) | Notes |
-|---|---|---|
-| Public practice set (40) | 0.848 | speed 1.0 (p95 0.03 s), consistency 1.0, no stale values |
-| Own validation set (30) | 1.000 | used for tuning, so optimistic |
-| Own holdout set #1 (25) | 0.84 | written before a round of changes and not tuned on |
-| Own holdout set #3 (22) | 0.82 | written before the validation rules (0.77 before them) |
-| Conflicts (own gold, 14) | pillar ~0.77 | recall 14/14, precision 0.58 |
+Accuracy (`qa_score`). Holdout sets are our own questions, each written before the change it was
+used to judge; #4 was written before the LLM routing and opened only after it was built.
+
+| Set | Questions | Rules only (no key) | With the LLM (Azure) |
+|---|---|---|---|
+| Public practice set | 40 | 0.848 | 0.864 |
+| Own validation set (tuned on) | 30 | 1.000 | 0.967 |
+| Holdout #1 | 25 | 0.840 | 0.960 |
+| Holdout #2 | 22 | 0.818 | 0.909 |
+| Holdout #3 | 22 | 0.818 | 0.864 |
+| Holdout #4 | 20 | 0.500 | 0.750 |
+| **All holdouts** | 89 | **0.753** | **0.876** |
+
+Public set, all four pillars (conflicts against our own 14-entry gold list): 0.837 without the
+LLM, 0.845 with it. With the LLM, p95 answer latency is ~2.3 s (speed ~0.98) instead of 0.03 s;
+consistency stays 1.0 and no stale value appears in any answer.
 
 Ingest of all five snapshots takes ~4-6 minutes, almost all of it embedding ~11k unique chunks on
 CPU. Embedding stops after a 15-minute budget (remaining chunks stay keyword-only), so ingest stays
@@ -126,8 +157,11 @@ falls back to keyword search automatically.
 
 ## Known limitations
 
-- Facts written in the fine print under a table (a HELOC's maximum APR, floor rate, credit-score
-  requirement) lose to the table row itself.
+- Without the LLM, facts in the fine print under a table (a HELOC's maximum APR, floor rate,
+  credit-score requirement) lose to the table row itself.
+- With or without it, a passage the retriever does not find cannot be used ("how many employees
+  were promoted in 2025" is on /careers but not retrieved); terms in years beyond seven
+  ("9-year certificate") are not converted to months, so the term check cannot refuse them.
 - Answers that need two pages combined (eligibility rules on `/about/join`, the three states on
   `/about`) are answered from one page only.
 - Two practice questions expect an older value than the newest page states: "employees who used
@@ -137,6 +171,6 @@ falls back to keyword search automatically.
 
 ## Development tools (`dev/`)
 
-`check.sh` (public + validation regression run), `retrieval_eval.py` (recall@k on 65 labelled
-questions), `conflict_report.py` + `conflicts_gold.json`, `trace.py` (one question through the
+`check.sh` (public + validation regression run; forces the LLM off), `ab_llm.sh` (rules vs LLM
+routing on all non-sealed sets), `retrieval_eval.py` (recall@k on 65 labelled questions), `conflict_report.py` + `conflicts_gold.json`, `trace.py` (one question through the
 pipeline), `fresh_clone_check.sh` (clone, clean venv, offline run: the graders' setup).
