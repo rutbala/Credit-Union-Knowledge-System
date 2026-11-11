@@ -28,6 +28,7 @@ import bisect
 import dataclasses
 import hashlib
 import math
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -39,446 +40,69 @@ sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().pare
 from contract import Answer, Conflict, Snapshot, Source  # noqa: E402
 
 
-# --------------------------------------------------------------------------------------
-# 1. Text helpers
-# --------------------------------------------------------------------------------------
 
-TOKEN = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
-STOPWORDS = frozenset(
-    "a an the and or of to for in on at by is are was were be been it its this that these those "
-    "what which who whom how when where why do does did can could would should will i you your we "
-    "our us my me with from as about into any some there their they them get give tell please".split()
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # so `kb` imports when loaded by path
+from kb.text import (  # noqa: E402
+    TOKEN,
+    STOPWORDS,
+    IMAGE,
+    LINK,
+    HEADING,
+    COUNTRY_LINE,
+    FOOTNOTE,
+    TABLE_SEP,
+    VALUE_HEADER,
+    DROP_HEADER,
+    MAX_CHUNK_CHARS,
+    MAX_LABELS,
+    MAX_LABEL_CHARS,
+    MAX_TABLE_ROWS,
+    SUFFIXES,
+    ES_PLURAL,
+    PLURAL_ACRONYMS,
+    stem,
+    tokenize,
+    clean_line,
+    line_links,
+    is_link_only,
+    Chunk,
+    split_cells,
+    render_rows,
+    split_page,
 )
-
-IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
-LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]*)[^)]*\)")
-HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
-# Phone-country pickers ("- 🇲🇾 Malaysia +60") are pure noise and full of numbers.
-COUNTRY_LINE = re.compile(r"^\s*-\s+\S+\s+[A-Za-z].*\+\d+\s*$")
-# Footnote markers glued to values: "5.39% APR1" -> "5.39% APR", "2.90%1" -> "2.90%".
-FOOTNOTE = re.compile(r"(%|\bAPR|\bAPY|\))\d{1,2}\b")
-TABLE_SEP = re.compile(r"^\|?[\s:|-]*-{3,}[\s:|-]*$")
-# Table columns that hold the value (everything before the first one describes the tier).
-VALUE_HEADER = re.compile(r"rate|apr|apy|yield|percentage|dividend|fee|min\.|minimum|price|cost", re.I)
-# Columns that only add distracting numbers to an answer.
-DROP_HEADER = re.compile(r"payment example|points", re.I)
-
-MAX_CHUNK_CHARS = 1500
-MAX_LABELS = 2          # plain-text label lines kept above a table ("Credit Cards", "Platinum Visa")
-MAX_LABEL_CHARS = 60
-MAX_TABLE_ROWS = 40
-
-
-SUFFIXES = ("ibility", "ability", "ations", "ation", "ition", "izing", "ized", "izes", "ible", "able",
-            "ings", "ing", "ies", "ied", "ers", "er", "ed", "ly")
-ES_PLURAL = re.compile(r"(s|x|z|ch|sh)es$")
-
-
-PLURAL_ACRONYMS = {"aprs": "apr", "apys": "apy", "cds": "cd", "atms": "atm", "iras": "ira", "hsas": "hsa"}
-
-
-def stem(word: str) -> str:
-    """Light suffix stripping so 'recognized' / 'recognition' or 'rates' / 'rate' meet."""
-    if word in PLURAL_ACRONYMS:
-        return PLURAL_ACRONYMS[word]
-    if word[0].isdigit() or len(word) < 4:
-        return word
-    # Plurals first: "certificates" -> "certificate", "fees" -> "fee", "branches" -> "branch".
-    if ES_PLURAL.search(word):
-        word = word[:-2]
-    elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
-        word = word[:-1]
-    if len(word) <= 4:
-        return word
-    for suf in SUFFIXES:
-        if word.endswith(suf) and len(word) - len(suf) >= 4:
-            return word[: -len(suf)]
-    return word
-
-
-def tokenize(text: str) -> List[str]:
-    return [stem(t) for t in TOKEN.findall(text.lower()) if t not in STOPWORDS and (len(t) > 1 or t.isdigit())]
-
-
-def clean_line(line: str) -> Optional[str]:
-    """Drop images and noise, keep link text, strip markdown escapes and footnote markers."""
-    if COUNTRY_LINE.match(line):
-        return None
-    line = LINK.sub(r"\1", IMAGE.sub("", line)).replace("\\", "").rstrip()
-    if line.strip() in ("✕", "* * *"):
-        return None
-    return FOOTNOTE.sub(r"\1", line)
-
-
-def line_links(line: str) -> List[Tuple[str, str]]:
-    """(anchor, url) for links to the credit union's own sites."""
-    out = []
-    for m in LINK.finditer(IMAGE.sub("", line)):
-        anchor, url = m.group(1).strip(), m.group(2)
-        if "dupaco.com" in url and "/hubfs/" not in url and "/hs-fs/" not in url:
-            out.append((anchor, url))
-    return out
-
-
-def is_link_only(line: str) -> bool:
-    return bool(LINK.search(line)) and not LINK.sub("", IMAGE.sub("", line)).strip()
-
-
-@dataclass(frozen=True)
-class Chunk:
-    url: str
-    heading: str                    # heading path (+ table labels), e.g. "Rates > Credit Cards > Platinum Visa"
-    text: str                       # prose, or the rendered table rows one per line
-    rows: Tuple[str, ...] = ()      # table chunks only: one rendered line per row
-    columns: str = ""               # table chunks only: the header cells ("Balance Tier | APY ...")
-    links: Tuple[Tuple[str, str], ...] = ()   # (anchor, url) of links inside the chunk
-
-    @property
-    def is_table(self) -> bool:
-        return bool(self.rows)
-
-
-def split_cells(line: str) -> List[str]:
-    return [c.strip() for c in line.strip().strip("|").split("|")]
-
-
-def render_rows(lines: List[str]) -> List[str]:
-    """Turn markdown table lines into self-describing rows.
-
-    "| Share Savings | $10,000 – $24,999.99 | 0.15% | ..." under its header becomes
-    "Share Savings, $10,000 – $24,999.99: Dividend Rate 0.15%; Annual Percentage Yield (APY) 0.15%; ..."
-    """
-    header: List[str] = []
-    body = lines
-    if len(lines) >= 2 and TABLE_SEP.match(lines[1].strip()):
-        header, body = split_cells(lines[0]), lines[2:]
-    first_value = next((i for i, h in enumerate(header) if VALUE_HEADER.search(h)), None)
-    if first_value == 0:
-        first_value = 1   # the first column always names the row
-    rows = []
-    for line in body[:MAX_TABLE_ROWS]:
-        cells = split_cells(line)
-        if not any(cells):
-            continue
-        if not header or first_value is None:
-            rows.append(" | ".join(c for c in cells if c))
-            continue
-        subject = ", ".join(c for c in cells[:first_value] if c and c != "—")
-        values = []
-        for h, c in zip(header[first_value:], cells[first_value:]):
-            if c and c != "—" and not DROP_HEADER.search(h):
-                values.append("%s %s" % (h, c))
-        rows.append("%s: %s" % (subject, "; ".join(values)) if values else subject)
-    return rows
-
-
-def split_page(url: str, title: str, md: str) -> List[Chunk]:
-    """Split a page into heading-delimited prose sections plus one chunk per table.
-
-    A table chunk's heading carries the plain-text labels written just above it, because
-    rate pages name products that way ("Credit Cards" / "Platinum Visa" / table).
-    """
-    chunks: List[Chunk] = []
-    path: List[Tuple[int, str]] = []
-    buf: List[str] = []
-    buf_links: List[Tuple[str, str]] = []
-    labels: List[str] = []
-    table: List[str] = []
-    skipping = False   # inside a "Handpicked for You" block of related-article cards
-
-    def heading_for(extra: List[str]) -> str:
-        return " > ".join([h for _, h in path] + extra) or title
-
-    def flush():
-        body = "\n".join(buf).strip()
-        links = tuple(dict.fromkeys(buf_links))
-        buf.clear()
-        buf_links.clear()
-        if len(body) < 20:
-            return
-        heading = heading_for([])
-        # Oversized sections are cut on paragraph boundaries so one chunk stays focused.
-        part: List[str] = []
-        size = 0
-        for para in body.split("\n\n"):
-            if size + len(para) > MAX_CHUNK_CHARS and part:
-                chunks.append(Chunk(url, heading, "\n\n".join(part), links=links))
-                part, size = [], 0
-            part.append(para)
-            size += len(para) + 2
-        if part:
-            chunks.append(Chunk(url, heading, "\n\n".join(part), links=links))
-
-    def flush_table():
-        if not table:
-            return
-        rows = tuple(render_rows(table))
-        columns = " | ".join(split_cells(table[0])) if len(table) > 1 and TABLE_SEP.match(table[1].strip()) else ""
-        table.clear()
-        if rows:
-            chunks.append(Chunk(url, heading_for(labels), "\n".join(rows), rows=rows, columns=columns))
-        if labels:
-            labels.pop()   # that label named this table; the outer category stays
-
-    for raw in md.splitlines():
-        m = HEADING.match(raw)
-        if m:
-            level, text = len(m.group(1)), clean_line(m.group(2).strip()) or ""
-            if skipping and level > 2:
-                continue
-            flush_table()
-            flush()
-            labels.clear()
-            # Related-article cards are other pages' teasers (titles + dates); they only add noise.
-            skipping = text.lower().startswith("handpicked for you")
-            if skipping:
-                continue
-            while path and path[-1][0] >= level:
-                path.pop()
-            path.append((level, text))
-            continue
-        if skipping:
-            continue
-        line = clean_line(raw)
-        if line is None:
-            continue
-        if line.lstrip().startswith("|"):
-            table.append(line)
-            continue
-        flush_table()
-        buf.append(line)
-        buf_links.extend(line_links(raw))
-        stripped = line.strip().strip("*").strip().lstrip("-•").strip()
-        if stripped and len(stripped) <= MAX_LABEL_CHARS and not is_link_only(raw):
-            labels.append(stripped)
-            del labels[:-MAX_LABELS]
-    flush_table()
-    flush()
-    return chunks
-
-
-# --------------------------------------------------------------------------------------
-# 2. Authority: which pages to believe
-# --------------------------------------------------------------------------------------
-# Lower tier = more authoritative. The official product and rate pages are what the credit
-# union maintains; promos, calculators and dated articles are where stale numbers survive.
-
-TIER_PRODUCT, TIER_PROMO, TIER_TOOL, TIER_ARTICLE, TIER_LISTING, TIER_JUNK = range(6)
-# Two weight tables. "Current fact" questions (a rate, fee, hours, address, link) must come
-# from maintained pages, so articles are pushed down hard. Other questions (awards, history,
-# events) are often only answered by a press release, so articles are only mildly discounted.
-TIER_WEIGHT_STRICT = {
-    TIER_PRODUCT: 1.0,
-    TIER_PROMO: 0.8,
-    TIER_TOOL: 0.55,
-    TIER_ARTICLE: 0.65,
-    TIER_LISTING: 0.4,
-}
-TIER_WEIGHT_MILD = {
-    TIER_PRODUCT: 1.0,
-    TIER_PROMO: 0.9,
-    TIER_TOOL: 0.7,
-    TIER_ARTICLE: 0.85,
-    TIER_LISTING: 0.5,
-}
-CURRENT_FACT = re.compile(
-    r"\b(rates?|apr|apy|dividend|interest|fees?|cost|charge|minimum|hours?|open|address|located|"
-    r"location|routing|phone|number|call|url|link|website|page|current(?:ly)?|now|today)\b", re.I)
-
-PROMO_PATHS = ("switch-and-earn", "earn-more", "mortgage-refi", "money-makeover", "first-time-homebuyer-grant",
-               "homebuying-guidance",
-               "21-day-sprint-to-savings-challenge", "sprint-to-savings-challenge")
-JUNK_PATHS = ("offer-expired", "subscription-preferences", "thankuse", "photo-release-form", "not-for-sale")
-LISTING_PREFIXES = ("newsroom/tag", "newsroom/author", "learn/blog/tag", "learn/blog/author",
-                    "business/resources/tag", "business/resources/author", "resources")
-ARTICLE_PREFIXES = ("learn/blog/", "newsroom/", "business/resources/", "dupacodaily/")
-TOOL_PREFIXES = ("calculators", "business-calculators", "hubfs/")
-
-MONTHS = {m: i + 1 for i, m in enumerate(
-    "january february march april may june july august september october november december".split())}
-DATE_LINE = re.compile(r"^\s*(" + "|".join(MONTHS) + r")\s+(\d{1,2}),\s+(\d{4})\s*$", re.I)
-
-
-def page_path(url: str) -> str:
-    return re.sub(r"^https?://[^/]+", "", url).strip("/").lower()
-
-
-def classify(url: str) -> int:
-    path = page_path(url)
-    first = path.split("/")[0].split("?")[0]
-    if first in JUNK_PATHS or (first == "privacy-policy" and "?" in path):
-        return TIER_JUNK
-    if path.startswith(LISTING_PREFIXES) or path in ("newsroom", "learn/blog", "business/resources"):
-        return TIER_LISTING
-    if path.startswith(ARTICLE_PREFIXES) or re.match(r"20\d\d/\d\d/", path):
-        return TIER_ARTICLE
-    if path.startswith(TOOL_PREFIXES):
-        return TIER_TOOL
-    if first in PROMO_PATHS or first.endswith("-lp"):
-        return TIER_PROMO
-    return TIER_PRODUCT
-
-
-def published_on(md: str) -> Optional[str]:
-    """An article's publish date: a bare 'Month DD, YYYY' line in its first few lines."""
-    for line in md.splitlines()[:12]:
-        m = DATE_LINE.match(line)
-        if m:
-            return "%s-%02d-%02d" % (m.group(3), MONTHS[m.group(1).lower()], int(m.group(2)))
-    return None
-
-
-def authority(tier: int, published: Optional[str], taken_on: str, strict: bool = True) -> float:
-    """Rerank weight for a page: its tier, and for articles how old they were at crawl time."""
-    w = (TIER_WEIGHT_STRICT if strict else TIER_WEIGHT_MILD).get(tier, 0.0)
-    if tier == TIER_ARTICLE and published:
-        age_years = (int(taken_on[:4]) - int(published[:4])) + (int(taken_on[5:7]) - int(published[5:7])) / 12
-        w *= max(0.75, 1.0 - 0.06 * max(age_years, 0.0))   # a 2026 release beats its 2021 twin
-    return w
-
-
-# --------------------------------------------------------------------------------------
-# 3. PageStore: full history of every page
-# --------------------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class PageVersion:
-    url: str
-    title: str
-    snapshot_id: str
-    taken_on: str      # snapshot date (ISO)
-    fetched_at: str    # when this copy was actually crawled; can predate taken_on
-    content_hash: str
-    tier: int                     # authority tier from the URL (TIER_*)
-    published: Optional[str]      # article publish date (ISO), None for undated pages
-    carried: bool = False         # missing from this crawl; last seen copy carried forward
-
-    def weight(self, strict: bool = True) -> float:
-        w = authority(self.tier, self.published, self.taken_on, strict)
-        return w * CARRIED_WEIGHT if self.carried else w
-
-
-class PageStore:
-    """Keeps every version of every page, plus which pages each snapshot contained."""
-
-    def __init__(self):
-        self.snapshot_ids: List[str] = []          # oldest -> newest
-        self.snapshot_dates: List[str] = []        # parallel to snapshot_ids
-        self.pages: Dict[str, Dict[str, PageVersion]] = {}   # snapshot_id -> url -> version
-        self.content: Dict[str, str] = {}          # content_hash -> markdown (deduplicated)
-        self.history: Dict[str, List[PageVersion]] = defaultdict(list)  # url -> versions, oldest first
-        self.carried: Dict[str, List[PageVersion]] = {}   # snapshot_id -> versions carried into it
-
-    def add(self, snapshot: Snapshot) -> List[PageVersion]:
-        """Record a snapshot; returns the versions whose content was not seen before."""
-        idx = bisect.bisect_right(self.snapshot_dates, snapshot.taken_on)
-        self.snapshot_ids.insert(idx, snapshot.snapshot_id)
-        self.snapshot_dates.insert(idx, snapshot.taken_on)
-
-        fresh = []
-        by_url = {}
-        for p in snapshot.pages:
-            h = hashlib.sha1(p.markdown.encode("utf-8")).hexdigest()
-            v = PageVersion(p.url, p.title, snapshot.snapshot_id, snapshot.taken_on, p.fetched_at, h,
-                            classify(p.url), published_on(p.markdown))
-            by_url[p.url] = v
-            self.history[p.url].append(v)
-            if h not in self.content:
-                self.content[h] = p.markdown
-                fresh.append(v)
-        # A snapshot is "every page we had": a page the crawl missed keeps its last known copy,
-        # marked as carried so it never outranks a page actually seen in this crawl.
-        prev = self.snapshot_ids[idx - 1] if idx > 0 else None
-        self.carried[snapshot.snapshot_id] = []
-        for url, old in (self.pages.get(prev, {}) if prev else {}).items():
-            if url not in by_url:
-                v = dataclasses.replace(old, snapshot_id=snapshot.snapshot_id, carried=True)
-                by_url[url] = v
-                self.carried[snapshot.snapshot_id].append(v)
-        self.pages[snapshot.snapshot_id] = by_url
-        return fresh
-
-    def snapshot_for(self, as_of: Optional[str]) -> Optional[str]:
-        """The snapshot that was live on `as_of` (newest taken on or before it).
-
-        No date -> newest snapshot. A date before the first snapshot -> the first one,
-        since it is the earliest view of the site we have.
-        """
-        if not self.snapshot_ids:
-            return None
-        if not as_of:
-            return self.snapshot_ids[-1]
-        i = bisect.bisect_right(self.snapshot_dates, as_of[:10]) - 1
-        return self.snapshot_ids[max(i, 0)]
-
-    def version(self, snapshot_id: str, url: str) -> Optional[PageVersion]:
-        return self.pages.get(snapshot_id, {}).get(url)
-
-
-# --------------------------------------------------------------------------------------
-# 4. SearchIndex: BM25 over unique chunks, filtered by snapshot
-# --------------------------------------------------------------------------------------
-
-class SearchIndex:
-    K1, B = 1.4, 0.75
-
-    def __init__(self):
-        self.chunks: List[Chunk] = []
-        self.lengths: List[int] = []
-        self.members: List[int] = []          # bitmask of snapshots containing each chunk
-        self.postings: Dict[str, List[Tuple[int, int]]] = defaultdict(list)  # term -> (chunk, tf)
-        self._by_key: Dict[Tuple[str, str, str], int] = {}
-        self._snap_bit: Dict[str, int] = {}
-
-    def _bit(self, snapshot_id: str) -> int:
-        if snapshot_id not in self._snap_bit:
-            self._snap_bit[snapshot_id] = 1 << len(self._snap_bit)
-        return self._snap_bit[snapshot_id]
-
-    def add(self, snapshot_id: str, chunk: Chunk) -> None:
-        """Index a chunk once; later snapshots that repeat it only set their membership bit."""
-        bit = self._bit(snapshot_id)
-        key = (chunk.url, chunk.heading, chunk.text)
-        i = self._by_key.get(key)
-        if i is not None:
-            self.members[i] |= bit
-            return
-        i = len(self.chunks)
-        self._by_key[key] = i
-        self.chunks.append(chunk)
-        self.members.append(bit)
-        terms = tokenize(chunk.heading) + tokenize(chunk.text)
-        self.lengths.append(len(terms))
-        for term, tf in Counter(terms).items():
-            self.postings[term].append((i, tf))
-
-    def search(self, query: str, snapshot_id: str, k: int = 5) -> List[Tuple[float, Chunk]]:
-        bit = self._snap_bit.get(snapshot_id)
-        if bit is None or not self.chunks:
-            return []
-        n = len(self.chunks)
-        avg = sum(self.lengths) / n
-        scores: Dict[int, float] = defaultdict(float)
-        for term in set(tokenize(query)):
-            plist = self.postings.get(term)
-            if not plist:
-                continue
-            idf = math.log(1 + (n - len(plist) + 0.5) / (len(plist) + 0.5))
-            for i, tf in plist:
-                if self.members[i] & bit:
-                    norm = tf + self.K1 * (1 - self.B + self.B * self.lengths[i] / avg)
-                    scores[i] += idf * tf * (self.K1 + 1) / norm
-        # Sort by score, then chunk index, so equal scores always come back in the same order.
-        top = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
-        return [(s, self.chunks[i]) for i, s in top]
-
-    def idf(self, term: str) -> float:
-        """Inverse document frequency; 0 for terms the site never uses."""
-        df = len(self.postings.get(term, ()))
-        if not df:
-            return 0.0
-        n = len(self.chunks)
-        return math.log(1 + (n - df + 0.5) / (df + 0.5))
+from kb.authority import (  # noqa: E402
+    TIER_PRODUCT,
+    TIER_PROMO,
+    TIER_TOOL,
+    TIER_ARTICLE,
+    TIER_LISTING,
+    TIER_JUNK,
+    TIER_WEIGHT_STRICT,
+    TIER_WEIGHT_MILD,
+    CURRENT_FACT,
+    PROMO_PATHS,
+    JUNK_PATHS,
+    LISTING_PREFIXES,
+    ARTICLE_PREFIXES,
+    TOOL_PREFIXES,
+    MONTHS,
+    DATE_LINE,
+    page_path,
+    classify,
+    published_on,
+    authority,
+)
+from kb.store import (  # noqa: E402
+    CARRIED_WEIGHT,
+    PageVersion,
+    PageStore,
+)
+from kb.ingest import find_boilerplate, strip_boilerplate  # noqa: E402
+from kb.vectors import VectorIndex, append_fusion, rrf  # noqa: E402
+from kb.llm import Writer  # noqa: E402
+from kb.bm25 import (  # noqa: E402
+    SearchIndex,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -1105,7 +729,9 @@ class FactStore:
                     if self.present(e, s):
                         seen_in[e.value].add(s)
                         where.setdefault(e.value, (e.url, s, e.row))
-            losers = sorted(values - {res.value}, key=lambda val: max(dates[s] for s in seen_in[val]) if seen_in[val] else "")
+            # Value as tie-breaker: set order changes with Python's per-run hash seed.
+            losers = sorted(values - {res.value},
+                            key=lambda val: (max(dates[s] for s in seen_in[val]) if seen_in[val] else "", val))
             live = {val for val in values if latest in seen_in[val]}
             stale_live = sorted(live - {res.value})
             parts = []
@@ -1161,9 +787,12 @@ def merge_conflicts(members: List[Conflict]) -> Conflict:
 # 7. KnowledgeBase: the contract object
 # --------------------------------------------------------------------------------------
 
-CARRIED_WEIGHT = 0.85    # pages missing from a crawl still count, slightly discounted
 EXPIRED = re.compile(r"\b(offer|promotion|promo|special)\b[^.\n]{0,30}\b(ended|expired|has ended|is over)\b"
                      r"|\boffer ended\b|\bno longer available\b", re.I)
+RETRIEVAL = os.environ.get("KB_RETRIEVAL", "hybrid")   # hybrid | bm25 | vector (A/B switch)
+FUSION = os.environ.get("KB_FUSION", "rrf")            # rrf | append
+DENSE_WEIGHT = float(os.environ.get("KB_DENSE_WEIGHT", "0.5"))   # keyword ranking leads; semantic adds recall
+STRIP_BOILERPLATE = os.environ.get("KB_BOILERPLATE", "1") != "0"   # A/B switch for evals
 CANDIDATES = 40          # BM25 hits pulled before reranking by authority
 TOP_CHUNKS = 25          # reranked chunks whose passages compete for the answer
 # No digits on purpose: a refusal that states any number is scored as a guess.
@@ -1174,30 +803,53 @@ class KnowledgeBase:
     def __init__(self):
         self.store = PageStore()
         self.index = SearchIndex()
+        self.vectors = VectorIndex.load()     # None -> BM25 only
+        self.writer = Writer.load()           # None -> deterministic answers only (KB_LLM)
         self.composer = Composer(self.index)
         self.facts = FactStore(self.store)
         self._cache: Dict[Tuple[str, str], Answer] = {}
 
     def ingest(self, snapshot: Snapshot) -> None:
         self.store.add(snapshot)
-        for p in snapshot.pages:
-            if classify(p.url) == TIER_JUNK:
-                continue
-            chunks = split_page(p.url, p.title, p.markdown)
+        carried = [v for v in self.store.carried.get(snapshot.snapshot_id, ()) if v.tier != TIER_JUNK]
+        live = [(p.url, p.markdown) for p in snapshot.pages if classify(p.url) != TIER_JUNK]
+        # Blocks repeated across many pages (teaser cards, notices) are kept on one page only.
+        boilerplate = find_boilerplate(live + [(v.url, self.store.content[v.content_hash]) for v in carried]) \
+            if STRIP_BOILERPLATE else {}
+        titles ={p.url: p.title for p in snapshot.pages}
+        for url, md in live:
+            chunks = split_page(url, titles[url], strip_boilerplate(url, md, boilerplate))
             for chunk in chunks:
                 self.index.add(snapshot.snapshot_id, chunk)
-            v = self.store.version(snapshot.snapshot_id, p.url)
-            self.facts.add_page(p.url, v.content_hash, chunks, "\n".join(c.text for c in chunks))
-        for v in self.store.carried.get(snapshot.snapshot_id, ()):
-            if v.tier != TIER_JUNK:
-                for chunk in split_page(v.url, v.title, self.store.content[v.content_hash]):
-                    self.index.add(snapshot.snapshot_id, chunk)
+            v = self.store.version(snapshot.snapshot_id, url)
+            self.facts.add_page(url, v.content_hash, chunks, "\n".join(c.text for c in chunks))
+        for v in carried:
+            md = strip_boilerplate(v.url, self.store.content[v.content_hash], boilerplate)
+            for chunk in split_page(v.url, v.title, md):
+                self.index.add(snapshot.snapshot_id, chunk)
+        if self.vectors is not None:
+            new = self.index.chunks[len(self.vectors.matrix):]
+            self.vectors.add([VectorIndex.passage_text(c.heading, c.text) for c in new])
 
     def _retrieve(self, question: str, snapshot_id: str, k: int = 5) -> List[Tuple[float, Chunk]]:
-        """BM25 candidates reranked by page authority as of that snapshot."""
+        """Keyword (BM25) and semantic candidates, fused by rank, then reranked by page authority."""
         strict = bool(CURRENT_FACT.search(question))
+        bm25 = self.index.search_ids(question, snapshot_id, k=CANDIDATES)
+        if self.vectors is not None and RETRIEVAL != "bm25":
+            bit = self.index._snap_bit.get(snapshot_id, 0)
+            dense = self.vectors.search(question, self.index.members, bit, k=CANDIDATES)
+            if RETRIEVAL == "vector":
+                candidates = dense
+            elif FUSION == "append":
+                candidates = append_fusion(bm25, dense, CANDIDATES)
+            else:
+                fused = rrf([i for i, _ in bm25], [i for i, _ in dense], weights=[1.0, DENSE_WEIGHT])
+                candidates = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:CANDIDATES]
+        else:
+            candidates = bm25
         ranked = []
-        for order, (score, chunk) in enumerate(self.index.search(question, snapshot_id, k=CANDIDATES)):
+        for order, (i, score) in enumerate(candidates):
+            chunk = self.index.chunks[i]
             v = self.store.version(snapshot_id, chunk.url)
             w = v.weight(strict) if v is not None else 0.0
             if w > 0:
@@ -1232,6 +884,8 @@ class KnowledgeBase:
         text, chunks, extra = self.composer.compose(q, units, lambda c, r: self._fix_row(c, r, sid, notes))
         sources = [Source(url=c.url, snapshot_id=sid, quote=c.heading[:200]) for c in chunks]
         sources += [Source(url=u, snapshot_id=sid) for u in extra]
+        if self.writer is not None:
+            text = self.writer.polish(question, text)   # falls back to `text` on any failure
         return Answer(text=text, sources=list({s.url: s for s in sources}.values()),
                       conflict_note="; ".join(dict.fromkeys(notes)) or None)
 

@@ -12,3 +12,5 @@ REVIEW.md
 .env.*
 !.env.example
 snapshots/
+.cache/
+submission/models/.locks/
