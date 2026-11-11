@@ -1,7 +1,8 @@
 """Dense (semantic) retrieval over the same chunks as the BM25 index, plus rank fusion.
 
 The embedding model (bge-small-en-v1.5, ONNX, quantized, 384-dim) runs locally through
-fastembed; its weights ship in submission/models so nothing is downloaded at grading time.
+fastembed; its weights ship in submission/models/bge-small-en-v1.5 as plain files, so nothing is
+downloaded at grading time.
 If fastembed or the weights are unavailable, `VectorIndex.load()` returns None and the
 system silently falls back to BM25 only.
 
@@ -17,6 +18,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
+MODEL_FOLDER = "bge-small-en-v1.5"      # model_optimized.onnx + tokenizer files
 MAX_CHARS = 1500        # the model reads ~512 tokens; longer chunks are cut
 BATCH = 32
 EMBED_BUDGET_S = float(os.environ.get("KB_EMBED_BUDGET_S", "900"))   # ingest is capped at 30 min
@@ -43,10 +45,16 @@ class VectorIndex:
         except Exception as e:      # package missing: BM25 only
             print("[kb] fastembed unavailable (%s); using BM25 only" % type(e).__name__, file=sys.stderr)
             return None
-        for local_only in (True, False):    # weights in the repo first; download only as a fallback
+        attempts = [
+            # The weights shipped in the repo (plain files, no download, no symlinks).
+            lambda: TextEmbedding(MODEL_NAME, specific_model_path=str(MODEL_DIR / MODEL_FOLDER)),
+            # Fallback: fastembed's own download (needs network).
+            lambda: TextEmbedding(MODEL_NAME),
+        ]
+        err = None
+        for attempt in attempts:
             try:
-                model = TextEmbedding(MODEL_NAME, cache_dir=str(MODEL_DIR), local_files_only=local_only)
-                return cls(model)
+                return cls(attempt())
             except Exception as e:
                 err = e
         print("[kb] embedding model unavailable (%s); using BM25 only" % type(err).__name__, file=sys.stderr)
