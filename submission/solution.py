@@ -132,17 +132,21 @@ ANSWER_KINDS = [(k, re.compile(q, re.I), re.compile(v, re.I) if v else None) for
 ACTION = re.compile(r"\b(join|apply|open|sign ?up|enroll|log ?in|become a member)\b", re.I)
 APP_HOST = re.compile(r"//(join|shine|homeloans|apply)\.", re.I)
 
-LIST_INTENT = re.compile(r"\b(what are|which|list|all|options|offer|rates)\b", re.I)
+LIST_INTENT = re.compile(r"\b(what are|which|list|all|options|offer|rates|can i get|do you have|available|kinds? of|types? of)\b", re.I)
 # Words that say *what kind* of answer is wanted but not *which* product; never required.
 GENERIC = frozenset(tokenize(
     "dupaco rate rates apr apy interest current currently today now offer offered provide know like want "
     "much many right still repeat see use need information info account accounts credit union "
-    "between earn going have get any also there highest lowest best top maximum max"))
+    "between earn going have get any also there highest lowest best top maximum max "
+    # Filler around the product ("over six years", "financing", "what does it pay") and date words
+    # (an "in May 2026" question is already answered from the May snapshot).
+    "over under would financing finance pay pays paying earning earns "
+    + " ".join(MONTHS)))
 # Question-side synonyms (stemmed): a focus term counts as covered if any alternative appears.
 SYNONYMS = {
     "cd": {"certificate"}, "cds": {"certificate"}, "certificate": {"cd"},
     "mortgage": {"home", "conventional"}, "card": {"visa"}, "join": {"member", "membership"},
-    "locator": {"location", "locat"}, "wallet": {"pay"}, "university": {"college"}, "college": {"university"},
+    "locator": {"location", "locat"}, "vehicle": {"auto"}, "car": {"auto"}, "truck": {"auto"}, "wallet": {"pay"}, "university": {"college"}, "college": {"university"},
 }
 
 # Capitalised words that name products or the institution, not a specific place or person.
@@ -162,6 +166,14 @@ AT_MOST = re.compile(r"(\$?\d[\d,]*(?:\.\d+)?)\s*(?:or less|and older|\(and olde
 RATE_SHEETS = ("rates", "business-rates")
 BUSINESS = re.compile(r"\bbusiness|\bcommercial\b", re.I)
 BUSINESS_PENALTY = 0.75
+# Variants of a product that are separate products: a "10-month special" question is about the
+# standard certificate, not the $100,000 jumbo one or the IRA version of it.
+VARIANT_WORDS = {"jumbo": re.compile(r"\bjumbo\b", re.I),
+                 "ira": re.compile(r"\b(ira|iras|roth|traditional)\b", re.I)}
+VARIANT_PENALTY = 0.75
+# "What does the Holiday Club pay?" / "what will I earn" ask for a rate even without the word.
+DEPOSIT_PAY = re.compile(r"\b(pays?|paying|earns?|earning)\b", re.I)
+DEPOSIT_WORDS = re.compile(r"\b(account|savings|certificate|cd|club|money market|checking|ira|balance)s?\b", re.I)
 MIN_RANGE_VALUE = 100    # question numbers below this are terms or counts, never tier amounts
 MIN_COVERAGE = 0.5       # share of the question's focus (idf-weighted) the answer must cover
 MIN_COVERAGE_QUALIFIED = 0.35   # ...lower when the row also matches the asked-for tier
@@ -190,6 +202,7 @@ class Query:
     term_numbers: List[Tuple[int, str]]   # (30, "year"), (60, "month")
     wants_list: bool
     business: bool                   # the question is about business products
+    variants: frozenset = frozenset()   # product variants the question names (jumbo, ira)
 
 
 NUMBER_WORDS = {w: str(i) for i, w in enumerate(
@@ -226,7 +239,10 @@ def parse_query(question: str) -> Query:
     term_numbers = [(int(n), u.lower()[:2]) for n, u in TERM_NUM.findall(question)]
     wants_list = bool(LIST_INTENT.search(question)) and not numbers
     business = bool(BUSINESS.search(question))
-    return Query(question, expansion, focus, names, kind, value_re, numbers, term_numbers, wants_list, business)
+    variants = frozenset(v for v, rx in VARIANT_WORDS.items() if rx.search(question) or (v == "ira" and re.search(r"retire", question, re.I)))
+    if kind is None and DEPOSIT_PAY.search(question) and DEPOSIT_WORDS.search(question):
+        kind, value_re = next((k, v) for k, _, v in ANSWER_KINDS if k == "rate")
+    return Query(question, expansion, focus, names, kind, value_re, numbers, term_numbers, wants_list, business, variants)
 
 
 def proper_names(question: str) -> List[str]:
@@ -364,7 +380,10 @@ class Composer:
                 s += 2.0 * weights.get(chunk.url, 0.0)   # authority of the page this passage is on
                 if not q.business and not q.wants_list and BUSINESS.search(chunk.heading + " " + text[:80]):
                     s -= BUSINESS_PENALTY    # "Rewards Visa" and "Business Rewards Visa" are different products
-                if chunk.is_table and q.kind in ("rate", "fee"):
+                label = chunk.heading.split(" > ")[-1] + " " + text[:80]
+                s -= VARIANT_PENALTY * sum(1 for v, rx in VARIANT_WORDS.items()
+                                           if v not in q.variants and rx.search(label))
+                if chunk.is_table and (q.kind in ("rate", "fee") or (q.wants_list and q.kind is None)):
                     s += 0.5    # rate tables are maintained; prose often quotes old numbers
                     if page_path(chunk.url) in RATE_SHEETS:
                         s += 0.5    # the official rate sheet beats product pages that copy it
@@ -659,8 +678,11 @@ class FactStore:
         cands.sort(key=lambda c: (c[0], c[1].value, c[1].url))
         best_rank = cands[0][0]
         group = [c for c in cands if c[0] == best_rank]
-        # Several equally authoritative pages: the value most of them state.
-        value = Counter(c[1].value for c in group).most_common(1)[0][0]
+        # Several equally authoritative pages: the value most of them state; if they split evenly
+        # (/rates updated, /business-rates not yet), the value the rest of the site agrees with.
+        in_group = Counter(c[1].value for c in group)
+        site = Counter(c[1].value for c in cands)
+        value = max(in_group, key=lambda val: (in_group[val], site[val], val))
         _, entry, version = next(c for c in group if c[1].value == value)
         if key not in self.prose_keys and page_path(version.url) not in RATE_SHEETS:
             successor = self.successor(key, snapshot_id)
@@ -793,6 +815,11 @@ RETRIEVAL = os.environ.get("KB_RETRIEVAL", "hybrid")   # hybrid | bm25 | vector 
 FUSION = os.environ.get("KB_FUSION", "rrf")            # rrf | append
 DENSE_WEIGHT = float(os.environ.get("KB_DENSE_WEIGHT", "0.5"))   # keyword ranking leads; semantic adds recall
 STRIP_BOILERPLATE = os.environ.get("KB_BOILERPLATE", "1") != "0"   # A/B switch for evals
+# Values that identify an answer's source: rates, dollar amounts, routing numbers, times, phones.
+CITE_VALUE = re.compile(r"\d+(?:\.\d+)?%|\$\d[\d,]*(?:\.\d+)?|\b\d{9}\b|\b\d{1,2}:\d{2}\b|\b\d{3}-\d{3}-\d{4}\b")
+MAX_CITE_VALUES = 8
+CITE_MIN_SHARE = 0.6     # a corroborating page must state at least this share of them
+MAX_EXTRA_SOURCES = 3
 CANDIDATES = 40          # BM25 hits pulled before reranking by authority
 TOP_CHUNKS = 25          # reranked chunks whose passages compete for the answer
 # No digits on purpose: a refusal that states any number is scored as a guess.
@@ -808,6 +835,7 @@ class KnowledgeBase:
         self.composer = Composer(self.index)
         self.facts = FactStore(self.store)
         self._cache: Dict[Tuple[str, str], Answer] = {}
+        self._pages_cache: Dict[str, List[Tuple[str, str]]] = {}
 
     def ingest(self, snapshot: Snapshot) -> None:
         self.store.add(snapshot)
@@ -886,8 +914,35 @@ class KnowledgeBase:
         sources += [Source(url=u, snapshot_id=sid) for u in extra]
         if self.writer is not None:
             text = self.writer.polish(question, text)   # falls back to `text` on any failure
+        sources += [Source(url=u, snapshot_id=sid) for u in self._corroborating(text, sid, {s.url for s in sources})]
         return Answer(text=text, sources=list({s.url: s for s in sources}.values()),
                       conflict_note="; ".join(dict.fromkeys(notes)) or None)
+
+    def _corroborating(self, text: str, sid: str, have: set) -> List[str]:
+        """Maintained product pages in this snapshot that state the answer's key values.
+
+        An answer built from the rate sheet is equally stated on the product's own page (auto
+        loans, home loans), and a routing number or hours line on /contact; citing those too
+        points the member to the page about their product."""
+        values = list(dict.fromkeys(CITE_VALUE.findall(text)))[:MAX_CITE_VALUES]
+        if not values:
+            return []
+        need = max(1, math.ceil(CITE_MIN_SHARE * len(values)))
+        found = []
+        for url, md in self._product_pages(sid):
+            if url in have:
+                continue
+            n = sum(1 for v in values if v in md)
+            if n >= need:
+                found.append((-n, len(page_path(url)), url))
+        return [u for _, _, u in sorted(found)[:MAX_EXTRA_SOURCES]]
+
+    def _product_pages(self, sid: str) -> List[Tuple[str, str]]:
+        if sid not in self._pages_cache:
+            self._pages_cache[sid] = [(u, self.store.content[v.content_hash])
+                                      for u, v in sorted(self.store.pages.get(sid, {}).items())
+                                      if v.tier == TIER_PRODUCT and not v.carried]
+        return self._pages_cache[sid]
 
     def _fact_answer(self, question: str, sid: str) -> Optional[Answer]:
         """Count-style questions answered from the resolved prose fact (newest statement wins)."""
@@ -943,7 +998,17 @@ class KnowledgeBase:
                 head = merge_conflicts([t[3] for t in members])
             merged.append((prio, m, head))
         merged.sort(key=lambda t: (-t[0], t[1], t[2].topic))
-        return [c for _, _, c in merged[:MAX_CONFLICTS]]
+        # 3. The same competing values under another name (IRA specials that mirror the
+        #    certificate specials, one checking table shown on two pages) are one contradiction;
+        #    listing it twice can only cost precision. Keep the highest-ranked copy.
+        out, seen = [], set()
+        for _, _, c in merged:
+            sig = frozenset(c.values)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(c)
+        return out[:MAX_CONFLICTS]
 
 
 def build() -> KnowledgeBase:
