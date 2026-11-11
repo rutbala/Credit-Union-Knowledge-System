@@ -54,7 +54,13 @@ qualifiers ("60-month", "2025 model year", "$10,000") and named products ("Volun
 Candidate rows and paragraphs are scored on search rank, coverage of the question, presence of the
 needed value, tier match (2025 falls inside "2024-27"; "48 Months" contradicts "60-month"), page
 authority, and an exact-name bonus. Products the member did not ask about are penalised: business
-versions, jumbo certificates, IRA versions.
+versions, jumbo certificates, IRA versions ("non-jumbo" / "not business" exclude them).
+
+**6b. Validate the winner.** A passage about a different loan or term product than the question
+names is not an answer: a "72-month certificate" or "96-month auto loan" question is never
+answered with auto or boat rows of that term; if no candidate is about the asked product, the
+system refuses. (Deposit accounts are not checked this way; their pages name each other too
+often.)
 
 **7. Resolve the current value of every fact.** Each table row (and a few prose statements:
 branch count, total assets, routing number, Forbes recognitions) becomes a dated fact keyed by
@@ -95,13 +101,22 @@ measured on our evaluation sets, it did not raise accuracy (the remaining misses
 problems or answers the practice set judges differently) and it added ~2 s of latency per routed
 question.
 
+## Tried and not adopted
+
+- **Cross-encoder reranker** (`kb/rerank.py`, `KB_RERANK=on`): a local fastembed cross-encoder
+  added to the rule score when choosing between prose passages. It fixed one development question
+  but left a fresh holdout unchanged (0.727 -> 0.727; with more weight 0.682), adds ~0.2 s per
+  answer, and the best model (126 MB) exceeds GitHub's file limit. Off.
+- **LLM fallback / rewriter** (above): no accuracy gain on our sets. Off.
+
 ## Results and runtime
 
 | Set | Score (accuracy) | Notes |
 |---|---|---|
 | Public practice set (40) | 0.848 | speed 1.0 (p95 0.03 s), consistency 1.0, no stale values |
 | Own validation set (30) | 1.000 | used for tuning, so optimistic |
-| Own holdout set (25) | 0.84 | written before the last round of changes and not tuned on |
+| Own holdout set #1 (25) | 0.84 | written before a round of changes and not tuned on |
+| Own holdout set #3 (22) | 0.82 | written before the validation rules (0.77 before them) |
 | Conflicts (own gold, 14) | pillar ~0.77 | recall 14/14, precision 0.58 |
 
 Ingest of all five snapshots takes ~4-6 minutes, almost all of it embedding ~11k unique chunks on

@@ -175,6 +175,24 @@ BUSINESS_PENALTY = 0.75
 VARIANT_WORDS = {"jumbo": re.compile(r"\bjumbo\b", re.I),
                  "ira": re.compile(r"\b(ira|iras|roth|traditional)\b", re.I)}
 VARIANT_PENALTY = 0.75
+# "non-jumbo", "not jumbo", "personal, not business": the member excludes that variant.
+NEGATED = r"(?:\bnon[- ]?|\bnot\s+(?:a\s+|the\s+)?)"
+# Loan and term products are separate families: a "72-month certificate" question must not be
+# answered with 72-month auto-loan rows. Deposit accounts are left out on purpose: savings,
+# money market and checking pages name each other too often for a safe check.
+PRODUCT_FAMILIES = {
+    "certificate": re.compile(r"\b(certificates?|cds?|share certificates?)\b", re.I),
+    "auto": re.compile(r"\b(auto|car|cars|vehicles?|truck|motorcycles?)\b", re.I),
+    "boat_rv": re.compile(r"\b(boats?|rvs?|campers?|recreational vehicles?)\b", re.I),
+    "powersport": re.compile(r"\b(atvs?|snowmobiles?|jet skis?|powersports?)\b", re.I),
+    "personal_loan": re.compile(r"\bpersonal loans?\b", re.I),
+    "mortgage": re.compile(r"\b(mortgages?|home loans?|refinanc\w*)\b", re.I),
+    "heloc": re.compile(r"\b(heloc|home equity)\b", re.I),
+    "home_improvement": re.compile(r"\bhome improvement\b", re.I),
+    "credit_card": re.compile(r"\b(credit cards?|visa)\b", re.I),
+    "student_loan": re.compile(r"\bstudent loans?\b", re.I),
+}
+FAMILY_PENALTY = 3.0
 # "What does the Holiday Club pay?" / "what will I earn" ask for a rate even without the word.
 DEPOSIT_PAY = re.compile(r"\b(pays?|paying|earns?|earning)\b", re.I)
 DEPOSIT_WORDS = re.compile(r"\b(account|savings|certificate|cd|club|money market|checking|ira|balance)s?\b", re.I)
@@ -208,6 +226,7 @@ class Query:
     business: bool                   # the question is about business products
     variants: frozenset = frozenset()   # product variants the question names (jumbo, ira)
     phrases: tuple = ()                 # multi-word names as written ("Volunteer Time Off")
+    families: frozenset = frozenset()   # loan/term product families the question names
 
 
 NUMBER_WORDS = {w: str(i) for i, w in enumerate(
@@ -242,6 +261,15 @@ CLAIM = re.compile(r"^\s*(do|does|is|are|can|will|did|has|have)\b", re.I)
 CLAIM_PCT = re.compile(r"\b\d+(?:\.\d+)?\s?%\s*(?:apy|apr)?", re.I)
 
 
+def asks_for(rx, text: str) -> bool:
+    """The text names this variant and does not negate it ("jumbo" yes, "non-jumbo" no)."""
+    return any(not re.search(NEGATED + r"$", text[:m.start()], re.I) for m in rx.finditer(text))
+
+
+def product_families(text: str) -> frozenset:
+    return frozenset(f for f, rx in PRODUCT_FAMILIES.items() if rx.search(text))
+
+
 def parse_query(question: str) -> Query:
     question = normalize_terms(question)
     toks = tokenize(question)
@@ -258,15 +286,17 @@ def parse_query(question: str) -> Query:
     numbers = [to_number(n) for n in NUM.findall(plain) if any(ch.isdigit() for ch in n)]
     term_numbers = [(int(n), u.lower()[:2]) for n, u in TERM_NUM.findall(question)]
     wants_list = bool(LIST_INTENT.search(question)) and not numbers
-    business = bool(BUSINESS.search(question))
-    variants = frozenset(v for v, rx in VARIANT_WORDS.items() if rx.search(question) or (v == "ira" and re.search(r"retire", question, re.I)))
+    business = asks_for(BUSINESS, question)
+    variants = frozenset(v for v, rx in VARIANT_WORDS.items()
+                         if asks_for(rx, question) or (v == "ira" and re.search(r"retire", question, re.I)))
+    families = product_families(question)
     if kind is None and DEPOSIT_PAY.search(question) and DEPOSIT_WORDS.search(question):
         kind, value_re = next((k, v) for k, _, v in ANSWER_KINDS if k == "rate")
     phrases = tuple(ph for ph in (re.sub(r"^dupaco\s+", "", m.lower())    # "Dupaco Platinum Visa" -> "platinum visa"
                                   for m in NAME_PHRASE.findall(question.split(" ", 1)[-1]))
                     if " " in ph and not set(tokenize(ph)) <= GENERIC)
     return Query(question, expansion, focus, names, kind, value_re, numbers, term_numbers, wants_list, business,
-                 variants, phrases)
+                 variants, phrases, families)
 
 
 def proper_names(question: str) -> List[str]:
@@ -360,6 +390,7 @@ class Scored:
     chunk: Chunk
     text: str
     order: int
+    wrong_product: bool = False   # about a different loan/term product than the question names
 
 
 class Composer:
@@ -413,15 +444,21 @@ class Composer:
                     s += 0.5    # rate tables are maintained; prose often quotes old numbers
                     if page_path(chunk.url) in RATE_SHEETS:
                         s += 0.5    # the official rate sheet beats product pages that copy it
+                # Validation: a row about another product family is not an answer at all.
+                fams = product_families(chunk.heading + " " + text[:120])
+                wrong_product = bool(q.families and fams and not (q.families & fams))
+                if wrong_product:
+                    s -= FAMILY_PENALTY
                 out.append(Scored(s, coverage, has_value, missing_rare, hits_n > 0 and not conflicts,
-                                  conflicts > 0 and hits_n == 0, chunk, text, order))
+                                  conflicts > 0 and hits_n == 0, chunk, text, order, wrong_product))
                 order += 1
         out.sort(key=lambda u: (-u.score, u.order))
         return out
 
     def refuse(self, best: Scored) -> bool:
         floor = MIN_COVERAGE_QUALIFIED if best.qualified else MIN_COVERAGE
-        return best.coverage < floor or not best.has_value or best.missing_rare or best.contradicts
+        return (best.coverage < floor or not best.has_value or best.missing_rare or best.contradicts
+                or best.wrong_product)
 
     def compose(self, q: Query, units: List[Scored],
                 fix_row=None) -> Tuple[str, List[Chunk], List[str]]:
