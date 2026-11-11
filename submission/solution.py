@@ -101,6 +101,7 @@ from kb.store import (  # noqa: E402
 from kb.ingest import find_boilerplate, strip_boilerplate  # noqa: E402
 from kb.vectors import VectorIndex, append_fusion, rrf  # noqa: E402
 from kb.llm import NOT_FOUND, Writer  # noqa: E402
+from kb.rerank import Reranker  # noqa: E402
 from kb.bm25 import (  # noqa: E402
     SearchIndex,
 )
@@ -232,6 +233,7 @@ NAME_PHRASE = re.compile(r"\b[A-Z][a-z]+(?:[ -](?:[A-Z][a-z]+|[A-Z]{2,}))+\b")
 PHRASE_BONUS = 1.0
 # Questions the rules hand to the LLM fallback (when one is configured).
 YES_NO = re.compile(r"^\s*(do|does|is|are|can)\b.*\b(all|any|every|same|still)\b", re.I)
+RERANK_TOP = 20          # candidates the cross-encoder reads per question
 LLM_WEAK_COVERAGE = 0.8   # best passage is prose covering less than this share of the question
 LLM_EXCERPTS = 10
 LLM_EXCERPT_CHARS = 700
@@ -897,6 +899,7 @@ class KnowledgeBase:
         self.index = SearchIndex()
         self.vectors = VectorIndex.load()     # None -> BM25 only
         self.writer = Writer.load()           # None -> deterministic answers only (KB_LLM)
+        self.reranker = Reranker.load()       # None -> rule scores only (KB_RERANK)
         self.composer = Composer(self.index)
         self.facts = FactStore(self.store)
         self._cache: Dict[Tuple[str, str], Answer] = {}
@@ -975,6 +978,8 @@ class KnowledgeBase:
         strict = bool(CURRENT_FACT.search(question))
         weights = {(c.url, c.heading): self._chunk_weight(c, sid, strict) for _, c in hits}
         units = self.composer.score(q, hits, weights)
+        if self.reranker is not None and units:
+            units = self._rerank(question, units)
         refused = not units or self.composer.refuse(units[0])
         if self.writer is not None and self.writer.fallback_enabled and self._needs_llm(question, q, units, refused):
             llm = self._llm_answer(question, sid, units)
@@ -991,6 +996,24 @@ class KnowledgeBase:
         sources += [Source(url=u, snapshot_id=sid) for u in self._corroborating(text, sid, {s.url for s in sources})]
         return Answer(text=text, sources=list({s.url: s for s in sources}.values()),
                       conflict_note="; ".join(dict.fromkeys(notes)) or None)
+
+    def _rerank(self, question: str, units: List[Scored]) -> List[Scored]:
+        """Add the cross-encoder's judgement to the rule score of the top candidates.
+
+        The rules have already scored value presence, tier match and authority; the reranker adds
+        "does this passage actually answer the question", which keyword coverage cannot see
+        (the "Maximum APR 21.00%" sentence vs the "HELOC 6.25%" row)."""
+        # Only between prose passages: measured on our sets, letting it overrule a table the rules
+        # chose (a product list, a rate row) broke right answers, while choosing the right
+        # paragraph of a long article ("Key West and Sycamore Street") is where it helps.
+        if units[0].chunk.is_table:
+            return units
+        top = units[:RERANK_TOP]
+        prose = [u for u in top if not u.chunk.is_table]
+        texts = [u.chunk.heading.split(" > ")[-1] + ": " + u.text for u in prose]
+        for u, r in zip(prose, self.reranker.scores(question, texts)):
+            u.score += self.reranker.weight * r
+        return sorted(top, key=lambda u: (-u.score, u.order)) + units[RERANK_TOP:]
 
     def _needs_llm(self, question: str, q: Query, units: List[Scored], refused: bool) -> bool:
         """The rules are unsure: they refused, the question checks a claimed value, it asks a
